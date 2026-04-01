@@ -1,0 +1,8 @@
+{
+  "steps": 30,
+  "cfg": 7.0,
+  "resolution": [1024, 1024],
+  "sampler": "DPM++ 2M Karras",
+  "vae": null
+}
+
