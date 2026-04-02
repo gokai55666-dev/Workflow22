@@ -1,15 +1,384 @@
-import streamlit as st, requests, time
+import streamlit as st
+import requests
+import json
+import os
+import random
+import time
+from datetime import datetime
 
-st.title("ComfyUI Generator")
+# ── Page config ─────────────────────────────────────────────────────────────
+st.set_page_config(
+    page_title="GIRL BOT AI Studio",
+    page_icon="🤖",
+    layout="wide",
+    initial_sidebar_state="expanded"
+)
 
-p=st.text_input("Prompt")
+# ── Load system config ───────────────────────────────────────────────────────
+CONFIG_PATH = "/workspace/system/config.json"
+try:
+    with open(CONFIG_PATH) as f:
+        CFG = json.load(f)
+except Exception:
+    # Fallback config if /workspace/system/config.json is not found
+    CFG = {
+        "hardware": {"gpu": "RTX 5090", "cuda": "12.8"},
+        "services": {
+            "ollama":  {"url": "http://localhost:11434"},
+            "comfyui": {"url": "http://localhost:8188"},
+            "frontend":{"url": "http://localhost:8501"},
+            "queue_api":{"url": "http://localhost:8000"}
+        },
+        "storage": {
+            "workflows": "/workspace/girlbot/workflows",
+            "output":    "/workspace/ComfyUI/output",
+            "logs":      "/workspace/logs"
+        },
+        "model": {"default": "dolphin-llama3:8b"}
+    }
 
-if st.button("Generate"):
- r=requests.post("http://localhost:8000/gen",json={"prompt":p}).json()
- j=r["job"]
- for _ in range(60):
-  res=requests.get(f"http://localhost:8000/res/{j}").json()
-  if res.get("status")=="done":
-   img=f"http://localhost:8188/view?filename={res['file']}&type=output"
-   st.image(img); break
-  time.sleep(2)
+OLLAMA_URL    = CFG["services"]["ollama"]["url"]
+COMFY_URL     = CFG["services"]["comfyui"]["url"]
+QUEUE_API_URL = CFG["services"]["queue_api"]["url"]
+WORKFLOW_DIR  = CFG["storage"]["workflows"]
+OUTPUT_DIR    = CFG["storage"].get("output", "/workspace/ComfyUI/output")
+DEFAULT_MODEL = CFG["model"]["default"]
+
+# ── Session state ────────────────────────────────────────────────────────────
+for key, default in [
+    ("messages", []),
+    ("personality", "Helpful Assistant"),
+    ("gen_mode", "basic"),
+    ("last_prompt_id", None),
+    ("use_queue", True), # New state for queue usage
+]:
+    if key not in st.session_state:
+        st.session_state[key] = default
+
+# ── Service helpers ──────────────────────────────────────────────────────────
+def check_service(url: str, timeout: float = 1.5) -> bool:
+    try:
+        r = requests.get(url, timeout=timeout)
+        return r.status_code < 500
+    except Exception:
+        return False
+
+def restart_service(name: str):
+    """Attempt service restart via shell (best-effort)."""
+    cmds = {
+        "ollama":   "OLLAMA_MODELS=/workspace/ollama OLLAMA_HOST=0.0.0.0:11434 nohup ollama serve > /workspace/logs/ollama.log 2>&1 &",
+        "comfyui":  "cd /workspace/ComfyUI && nohup python3 main.py --listen 0.0.0.0 --port 8188 --highvram > /workspace/logs/comfyui.log 2>&1 &",
+        "queue_api": "cd /workspace/girlbot && nohup uvicorn queue_api:app --host 0.0.0.0 --port 8000 > /workspace/logs/queue_api.log 2>&1 &",
+        "streamlit":"nohup streamlit run /workspace/girlbot/app.py --server.address 0.0.0.0 --server.port 8501 --server.headless true > /workspace/logs/streamlit.log 2>&1 &",
+    }
+    if name in cmds:
+        os.system(cmds[name])
+        time.sleep(5)
+        return True
+    return False
+
+# ── Dynamic workflow construction (for direct ComfyUI calls, if queue is off) ──
+def construct_workflow_direct(prompt: str, mode: str = "basic", seed: int = None) -> dict:
+    """
+    Builds a ComfyUI workflow JSON dynamically from a user prompt.
+    Reads base template, then modifies nodes based on intent.
+    """
+    if seed is None:
+        seed = random.randint(1, 2**31)
+
+    # Load base template
+    template = os.path.join(WORKFLOW_DIR, f"text2img_{mode}.json")
+    if not os.path.exists(template):
+        template = os.path.join(WORKFLOW_DIR, "text2img_basic.json")
+
+    with open(template) as f:
+        wf = json.load(f)
+
+    prompt_lower = prompt.lower()
+
+    # --- Detect intent and modify workflow dynamically ---
+    # Quality boost keywords
+    if any(k in prompt_lower for k in ["detailed", "high quality", "hq", "4k", "realistic", "photo"]):
+        mode = "hq"
+        template_hq = os.path.join(WORKFLOW_DIR, "text2img_hq.json")
+        if os.path.exists(template_hq):
+            with open(template_hq) as f:
+                wf = json.load(f)
+
+    # Anime/illustration style
+    if any(k in prompt_lower for k in ["anime", "manga", "cartoon", "illustration", "drawing"]):
+        prefix = "anime style, illustration, "
+    # Photorealistic style
+    elif any(k in prompt_lower for k in ["photo", "realistic", "real", "photograph"]):
+        prefix = "photorealistic, DSLR, 8k, sharp focus, "
+    # Artistic
+    elif any(k in prompt_lower for k in ["painting", "art", "artistic", "watercolor", "oil"]):
+        prefix = "masterpiece painting, highly detailed, artistic, "
+    else:
+        prefix = ""
+
+    # Find & update positive prompt node
+    for node_id, node in wf.items():
+        if node.get("class_type") == "CLIPTextEncode" and node_id == "2":
+            existing = node["inputs"].get("text", "")
+            # Prepend existing quality prefixes + user prompt
+            node["inputs"]["text"] = f"{prefix}{existing}{prompt}".strip(", ")
+
+    # Find & update KSampler seed
+    for node_id, node in wf.items():
+        if node.get("class_type") == "KSampler":
+            node["inputs"]["seed"] = seed
+            # Boost steps for portrait/face keywords
+            if any(k in prompt_lower for k in ["portrait", "face", "person", "woman", "man", "girl", "boy"]):
+                node["inputs"]["steps"] = max(node["inputs"].get("steps", 20), 30)
+                node["inputs"]["cfg"] = 7.5
+
+    # Auto-upscale resolution for high quality
+    for node_id, node in wf.items():
+        if node.get("class_type") == "EmptyLatentImage":
+            if mode == "hq" or any(k in prompt_lower for k in ["4k", "high res", "detailed"]):
+                node["inputs"]["width"]  = 1024
+                node["inputs"]["height"] = 1024
+
+    return wf, seed
+
+def generate_image_direct(prompt: str, mode: str = "basic"):
+    """Submit dynamic workflow to ComfyUI directly and return result."""
+    try:
+        wf, seed = construct_workflow_direct(prompt, mode)
+        r = requests.post(f"{COMFY_URL}/prompt", json={"prompt": wf}, timeout=10)
+        r.raise_for_status()
+        prompt_id = r.json().get("prompt_id", "unknown")
+        st.session_state.last_prompt_id = prompt_id
+        return f"✅ Generation submitted directly to ComfyUI!\n- Prompt ID: `{prompt_id}`\n- Seed: `{seed}`\n- Mode: `{mode}`\n\nCheck ComfyUI or the output folder when done."
+    except requests.exceptions.ConnectionError:
+        return "❌ ComfyUI unreachable. Try restarting from the sidebar."
+    except Exception as e:
+        return f"❌ Error: {e}"
+
+def poll_image_result_direct(prompt_id: str):
+    """Check if a generation is done and return the image path (direct ComfyUI)."""
+    try:
+        r = requests.get(f"{COMFY_URL}/history/{prompt_id}", timeout=5)
+        history = r.json()
+        if prompt_id in history:
+            outputs = history[prompt_id].get("outputs", {})
+            for node_output in outputs.values():
+                if "images" in node_output:
+                    for img in node_output["images"]:
+                        path = os.path.join(OUTPUT_DIR, img["filename"])
+                        if os.path.exists(path):
+                            return path
+    except Exception:
+        pass
+    return None
+
+# ── Image generation via Queue API ──────────────────────────────────────────
+def generate_image_queued(prompt: str, mode: str = "basic"):
+    """Submit generation job to Queue API."""
+    try:
+        payload = {"prompt": prompt, "mode": mode}
+        r = requests.post(f"{QUEUE_API_URL}/gen", json=payload, timeout=10)
+        r.raise_for_status()
+        response_data = r.json()
+        job_id = response_data.get("job_id")
+        position = response_data.get("position")
+        st.session_state.last_prompt_id = job_id # Use job_id for tracking
+        return f"✅ Job submitted to queue!\n- Job ID: `{job_id}`\n- Position in queue: `{position}`\n- Mode: `{mode}`\n\nCheck result using 'Check Result' button."
+    except requests.exceptions.ConnectionError:
+        return "❌ Queue API unreachable. Try restarting from the sidebar."
+    except Exception as e:
+        return f"❌ Error submitting job to queue: {e}"
+
+def poll_image_result_queued(job_id: str):
+    """Poll Queue API for job result."""
+    try:
+        r = requests.get(f"{QUEUE_API_URL}/res/{job_id}", timeout=5)
+        r.raise_for_status()
+        result = r.json()
+        if result.get("status") == "done":
+            filename = result.get("file")
+            if filename:
+                # The queue API returns just the filename, we need to construct the full path
+                # Assuming ComfyUI output is directly in OUTPUT_DIR
+                path = os.path.join(OUTPUT_DIR, filename)
+                if os.path.exists(path):
+                    return path
+        elif result.get("status") == "error":
+            return f"❌ Job failed: {result.get("message", "Unknown error")}"
+        return None # Still pending
+    except requests.exceptions.ConnectionError:
+        return "❌ Queue API unreachable."
+    except Exception as e:
+        return f"❌ Error polling queue: {e}"
+
+# ── Ollama chat ───────────────────────────────────────────────────────────────
+PERSONALITIES = {
+    "Helpful Assistant":   "You are GIRL BOT AI, a helpful and friendly assistant. Be concise and clear.",
+    "Creative Director":   "You are GIRL BOT AI in Creative Director mode. Think visually, suggest bold ideas, be imaginative.",
+    "Strict Coder":        "You are GIRL BOT AI in Coder mode. Be precise, technical, and efficient. Show code examples.",
+    "Philosopher":         "You are GIRL BOT AI in Philosopher mode. Think deeply, question assumptions, be thought-provoking.",
+}
+
+def chat_ollama(prompt: str, personality: str) -> str:
+    system = PERSONALITIES.get(personality, PERSONALITIES["Helpful Assistant"])
+    try:
+        r = requests.post(
+            f"{OLLAMA_URL}/api/generate",
+            json={
+                "model":  DEFAULT_MODEL,
+                "prompt": f"{system}\n\nUser: {prompt}\nAI:",
+                "stream": False
+            },
+            timeout=120
+        )
+        r.raise_for_status()
+        return r.json().get("response", "No response from model.")
+    except requests.exceptions.ConnectionError:
+        return "❌ Cannot reach Ollama. Is it running on port 11434?"
+    except requests.exceptions.Timeout:
+        return "⏳ Ollama timed out. The model may still be loading — try again in 10s."
+    except Exception as e:
+        return f"❌ Error: {e}"
+
+# ── SIDEBAR ───────────────────────────────────────────────────────────────────
+with st.sidebar:
+    st.title("⚙️ GIRL BOT AI")
+    st.caption(f"{CFG["hardware"]["gpu"]} · CUDA {CFG["hardware"]["cuda"]}")
+
+    st.divider()
+    st.subheader("🟢 Service Status")
+
+    col1, col2, col3 = st.columns(3)
+    ollama_ok  = check_service(f"{OLLAMA_URL}/api/tags")
+    comfy_ok   = check_service(f"{COMFY_URL}/system_stats")
+    queue_ok   = check_service(f"{QUEUE_API_URL}/health")
+
+    col1.metric("Ollama",  "✅ Up" if ollama_ok  else "❌ Down")
+    col2.metric("ComfyUI", "✅ Up" if comfy_ok   else "❌ Down")
+    col3.metric("Queue",   "✅ Up" if queue_ok   else "❌ Down")
+
+    if not ollama_ok:
+        if st.button("🔄 Restart Ollama"):
+            restart_service("ollama")
+            st.rerun()
+
+    if not comfy_ok:
+        if st.button("🔄 Restart ComfyUI"):
+            restart_service("comfyui")
+            st.rerun()
+
+    if not queue_ok:
+        if st.button("🔄 Restart Queue API"):
+            restart_service("queue_api")
+            st.rerun()
+
+    st.divider()
+    st.subheader("🤖 Personality")
+    st.session_state.personality = st.selectbox(
+        "Mode",
+        list(PERSONALITIES.keys()),
+        index=list(PERSONALITIES.keys()).index(st.session_state.personality)
+    )
+
+    st.divider()
+    st.subheader("🎨 Image Settings")
+    st.session_state.gen_mode = st.selectbox("Quality", ["basic", "hq"], index=0)
+    st.session_state.use_queue = st.checkbox("Use Queue API for Image Gen", value=st.session_state.use_queue)
+
+    # Check last generation
+    if st.session_state.last_prompt_id:
+        st.caption(f"Last ID: `{st.session_state.last_prompt_id[:8]}...`")
+        if st.button("🖼 Check Result"):
+            if st.session_state.use_queue:
+                img_path = poll_image_result_queued(st.session_state.last_prompt_id)
+            else:
+                img_path = poll_image_result_direct(st.session_state.last_prompt_id)
+
+            if img_path and os.path.exists(img_path):
+                st.image(img_path, caption="Latest generation")
+            elif img_path and img_path.startswith("❌"):
+                st.error(img_path)
+            else:
+                st.info("Still generating or not found yet.")
+
+    st.divider()
+    st.subheader("🔧 Tools")
+    if st.button("📋 System Config"):
+        st.code(json.dumps(CFG, indent=2), language="json")
+
+    if st.button("📁 Show Workflows"):
+        wfs = [f for f in os.listdir(WORKFLOW_DIR) if f.endswith(".json")] if os.path.exists(WORKFLOW_DIR) else []
+        st.write(wfs)
+
+    disk = os.popen("df -h /workspace 2>/dev/null | awk 'NR==2{print $3\"/\"$2\" (\"$5\" used)\"}' ").read().strip()
+    if disk:
+        st.caption(f"💾 {disk}")
+
+    st.link_button("Open ComfyUI", COMFY_URL)
+    if queue_ok:
+        st.link_button("Open Queue API Docs", f"{QUEUE_API_URL}/docs")
+
+# ── MAIN CHAT INTERFACE ───────────────────────────────────────────────────────
+st.title("🤖 GIRL BOT AI Studio")
+st.caption("RTX 5090 · Ollama + ComfyUI + Queue API · Type `draw: <prompt>` to generate images")
+
+# Warn if services are down
+if not ollama_ok:
+    st.warning("⚠️ Ollama is not running. Chat will fail. Use sidebar to restart.")
+if not comfy_ok:
+    st.warning("⚠️ ComfyUI is not running. Image generation will fail. Use sidebar to restart.")
+if not queue_ok and st.session_state.use_queue:
+    st.warning("⚠️ Queue API is not running. Queued image generation will fail. Use sidebar to restart.")
+
+# Chat history
+for msg in st.session_state.messages:
+    with st.chat_message(msg["role"]):
+        st.markdown(msg["content"])
+
+# Chat input
+if user_input := st.chat_input("Ask anything or type 'draw: your description'..."):
+    st.session_state.messages.append({"role": "user", "content": user_input})
+    with st.chat_message("user"):
+        st.markdown(user_input)
+
+    with st.chat_message("assistant"):
+        inp_lower = user_input.lower()
+
+        # --- Image generation ---
+        if inp_lower.startswith(("draw:", "generate:", "image:", "create:")):
+            gen_prompt = user_input.split(":", 1)[1].strip()
+            with st.spinner(f"🎨 Building workflow for: {gen_prompt}..."):
+                if st.session_state.use_queue:
+                    response = generate_image_queued(gen_prompt, st.session_state.gen_mode)
+                else:
+                    response = generate_image_direct(gen_prompt, st.session_state.gen_mode)
+            st.markdown(response)
+
+        # --- Show current workflow structure ---
+        elif "workflow" in inp_lower and ("show" in inp_lower or "json" in inp_lower):
+            # This will show the direct workflow structure, not the queued one
+            wf, seed = construct_workflow_direct("example prompt", st.session_state.gen_mode)
+            st.code(json.dumps(wf, indent=2), language="json")
+            response = "Above is the current dynamic workflow (for direct ComfyUI calls). Modify via the quality dropdown."
+
+        # --- Self-check ---
+        elif any(k in inp_lower for k in ["status", "health", "running", "check services"]):
+            lines = [
+                f"- Ollama: {'✅ Running' if ollama_ok else '❌ Down'}",
+                f"- ComfyUI: {'✅ Running' if comfy_ok else '❌ Down'}",
+                f"- Queue API: {'✅ Running' if queue_ok else '❌ Down'}",
+                f"- GPU: {CFG["hardware"]["gpu"]} ({CFG["hardware"]["cuda"]})",
+                f"- Model: {DEFAULT_MODEL}",
+                f"- Workflows: {', '.join(os.listdir(WORKFLOW_DIR)) if os.path.exists(WORKFLOW_DIR) else 'None'}",
+            ]
+            response = "**System Status:**\n" + "\n".join(lines)
+            st.markdown(response)
+
+        # --- General Ollama chat ---
+        else:
+            with st.spinner("Thinking..."):
+                response = chat_ollama(user_input, st.session_state.personality)
+            st.markdown(response)
+
+    st.session_state.messages.append({"role": "assistant", "content": response})
